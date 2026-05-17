@@ -6,6 +6,7 @@ using Snacks.Data;
 using Snacks.Hubs;
 using Snacks.Models;
 using System.Collections.Concurrent;
+using System.Net;
 using System.Text;
 using System.Text.Json;
 
@@ -1892,7 +1893,9 @@ public sealed class ClusterService : IHostedService, IDisposable
                 try
                 {
                     // Upload file as pure binary chunks
-                    await _fileTransfer.UploadFileToNodeAsync(client, baseUrl, workItem, jobCts.Token);
+                    var isWanUpload = IsWanTransferNode(node);
+                    await _fileTransfer.UploadFileToNodeAsync(
+                        client, baseUrl, workItem, isWanUpload, jobCts.Token);
                 }
                 finally
                 {
@@ -2403,10 +2406,15 @@ public sealed class ClusterService : IHostedService, IDisposable
             IAsyncDisposable? dlThrottleHandle = (_transferThrottle != null && workItem.AssignedNodeId != null)
                 ? await _transferThrottle.AcquireDownloadAsync(workItem.AssignedNodeId, dlToken)
                 : null;
+            var isWanDownload = workItem.AssignedNodeId != null
+                && _nodes.TryGetValue(workItem.AssignedNodeId, out var dlNode)
+                    ? IsWanTransferNode(dlNode)
+                    : IsWanTransferBaseUrl(nodeBaseUrl);
+
             try
             {
                 await _fileTransfer.DownloadFileFromNodeAsync(
-                    dlClient, nodeBaseUrl, jobId, outputPath, workItem, dlToken);
+                    dlClient, nodeBaseUrl, jobId, outputPath, workItem, isWanDownload, dlToken);
             }
             finally
             {
@@ -3815,7 +3823,9 @@ public sealed class ClusterService : IHostedService, IDisposable
 
                                 var uploadClient = _discovery.CreateAuthenticatedClient();
                                 await _fileTransfer.RegisterMetadataAsync(uploadClient, baseUrl, metadata, recoveryCts.Token);
-                                await _fileTransfer.UploadFileToNodeAsync(uploadClient, baseUrl, workItem, recoveryCts.Token);
+                                await _fileTransfer.UploadFileToNodeAsync(
+                                    uploadClient, baseUrl, workItem,
+                                    IsWanTransferNode(nodeForDispatch), recoveryCts.Token);
 
                                 var finalSize = await _fileTransfer.GetNodeReceivedBytesAsync(uploadClient, baseUrl, workItem.Id);
                                 if (finalSize != workItem.Size)
@@ -3913,6 +3923,31 @@ public sealed class ClusterService : IHostedService, IDisposable
             options ??= new EncoderOptions();
         }
         return options;
+    }
+
+    /// <summary>
+    ///     Whether transfers to this node should use the WAN profile (Pangolin/public path).
+    /// </summary>
+    private static bool IsWanTransferNode(ClusterNode node) =>
+        ClusterNetworkHelper.IsWanNode(node);
+
+    /// <summary>
+    ///     Resolves WAN vs LAN for a base URL when the live node registry is unavailable.
+    /// </summary>
+    private static bool IsWanTransferBaseUrl(string nodeBaseUrl)
+    {
+        try
+        {
+            var host = new Uri(nodeBaseUrl).Host;
+            if (IPAddress.TryParse(host, out var ip))
+                return !ClusterNetworkHelper.IsLocalNetwork(ip);
+            return !ClusterNetworkHelper.HostResolvesToLocalNetwork(host);
+        }
+        catch
+        {
+            // Malformed URL — prefer WAN-safe chunking when we cannot classify.
+            return true;
+        }
     }
 
     /// <summary> Builds the base URL for inter-node HTTP communication. </summary>

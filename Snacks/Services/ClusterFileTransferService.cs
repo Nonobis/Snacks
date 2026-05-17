@@ -3,6 +3,7 @@ namespace Snacks.Services;
 using Microsoft.AspNetCore.SignalR;
 using Snacks.Hubs;
 using Snacks.Models;
+using Snacks.Services.Cluster;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Security.Cryptography;
@@ -25,6 +26,9 @@ public sealed class ClusterFileTransferService
     ///     this when one is wired in by <c>ClusterService</c>.
     /// </summary>
     internal const int ChunkSize = 50 * 1024 * 1024;
+
+    /// <summary> Historical LAN download retry budget (unchanged by WAN profile work). </summary>
+    private const int LanDownloadMaxSessionFailures = 120;
 
     /******************************************************************
      *  Dependencies
@@ -106,20 +110,27 @@ public sealed class ClusterFileTransferService
     }
 
     /// <summary>
-    ///     Uploads a source file to a worker node in 50 MB chunks with SHA256 verification.
+    ///     Uploads a source file to a worker node in chunks with SHA256 verification.
     ///     Supports resume from the last chunk-aligned byte offset reported by the node.
     ///     Pure binary upload — metadata is registered separately via <see cref="RegisterMetadataAsync"/>.
     /// </summary>
+    /// <param name="isWanNode">
+    ///     When <see langword="true"/> (Pangolin/public path), applies the WAN profile:
+    ///     25 MB chunk cap, exponential backoff, fewer session retries.
+    /// </param>
     public async Task UploadFileToNodeAsync(
-        HttpClient client, string baseUrl, WorkItem workItem, CancellationToken ct = default)
+        HttpClient client, string baseUrl, WorkItem workItem, bool isWanNode = false,
+        CancellationToken ct = default)
     {
         var totalSize = workItem.Size;
-        // The throttle's chunk size is user-configurable (Networking tab);
-        // fall back to the historical 50MB constant when no throttle is wired.
-        int chunkSize = _throttle?.ChunkSizeBytes ?? ChunkSize;
+        var profile   = isWanNode ? TransferProfile.Wan : TransferProfile.Lan;
+        var baseChunk = _throttle?.ChunkSizeBytes ?? ChunkSize;
+        int chunkSize = profile.EffectiveChunkBytes(baseChunk);
+
         Console.WriteLine(
             $"Cluster: Uploading {workItem.FileName} ({totalSize / 1048576}MB) to " +
-            $"{workItem.AssignedNodeName} in {chunkSize / 1048576}MB chunks...");
+            $"{workItem.AssignedNodeName} in {chunkSize / 1048576}MB chunks" +
+            (isWanNode ? " (WAN profile)" : "") + "...");
 
         long rawOffset = await GetNodeReceivedBytesAsync(client, baseUrl, workItem.Id);
         long offset    = (rawOffset / chunkSize) * chunkSize;
@@ -159,8 +170,7 @@ public sealed class ClusterFileTransferService
             Console.WriteLine(
                 $"Cluster: Resuming upload at {offset / 1048576}MB (aligned from {rawOffset / 1048576}MB)");
 
-        int       consecutiveFailures    = 0;
-        const int MaxConsecutiveFailures = 60;
+        int consecutiveFailures = 0;
 
         using var fileStream = new FileStream(
             workItem.Path, FileMode.Open, FileAccess.Read, FileShare.Read);
@@ -287,20 +297,20 @@ public sealed class ClusterFileTransferService
                 catch (Exception ex)
                 {
                     consecutiveFailures++;
-                    var delay = 5;
+                    var delay = profile.RetryDelaySeconds(consecutiveFailures);
 
                     Console.WriteLine(
                         $"Cluster: Upload chunk failed at {offset / 1048576}MB " +
-                        $"(failure {consecutiveFailures}/{MaxConsecutiveFailures}): " +
+                        $"(failure {consecutiveFailures}/{profile.MaxSessionFailures}): " +
                         $"{ex.Message} — retrying in {delay}s...");
 
                     workItem.ErrorMessage = $"Upload retry {consecutiveFailures} — {ex.Message}";
                     await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem, ct);
 
-                    if (consecutiveFailures >= MaxConsecutiveFailures)
+                    if (consecutiveFailures >= profile.MaxSessionFailures)
                         throw new Exception(
                             $"Upload failed at {offset / 1048576}MB after " +
-                            $"{MaxConsecutiveFailures} consecutive failures");
+                            $"{profile.MaxSessionFailures} consecutive failures");
 
                     await Task.Delay(TimeSpan.FromSeconds(delay), ct);
                 }
@@ -322,24 +332,22 @@ public sealed class ClusterFileTransferService
      ******************************************************************/
 
     /// <summary>
-    ///     Downloads an encoded output file from a worker node in 50 MB chunks with SHA256 verification.
+    ///     Downloads an encoded output file from a worker node in chunks with SHA256 verification.
     ///     Supports resume from the last chunk-aligned byte offset of the partial file on disk.
     /// </summary>
-    /// <param name="client"> An already-authenticated <see cref="HttpClient"/>. </param>
-    /// <param name="nodeBaseUrl"> The base URL of the source worker node. </param>
-    /// <param name="jobId"> The unique job identifier used to locate the output on the node. </param>
-    /// <param name="outputPath"> Local path where the downloaded file will be written. </param>
-    /// <param name="workItem"> The work item being downloaded (used for progress updates). </param>
-    /// <param name="ct"> Cancellation token. </param>
+    /// <param name="isWanNode"> When <see langword="true"/>, applies the WAN transfer profile. </param>
     public async Task DownloadFileFromNodeAsync(
         HttpClient client, string nodeBaseUrl, string jobId, string outputPath,
-        WorkItem workItem, CancellationToken ct = default)
+        WorkItem workItem, bool isWanNode = false, CancellationToken ct = default)
     {
-        int chunkSize = _throttle?.ChunkSizeBytes ?? ChunkSize;
-        long   offset                    = 0;
-        long   totalSize                 = 0;
-        int    consecutiveFailures       = 0;
-        const int MaxConsecutiveFailures = 120;
+        var profile   = isWanNode ? TransferProfile.Wan : TransferProfile.Lan;
+        var baseChunk = _throttle?.ChunkSizeBytes ?? ChunkSize;
+        int chunkSize = profile.EffectiveChunkBytes(baseChunk);
+
+        long offset              = 0;
+        long totalSize           = 0;
+        int  consecutiveFailures = 0;
+        int  maxSessionFailures  = isWanNode ? profile.MaxSessionFailures : LanDownloadMaxSessionFailures;
 
         // If a partial download exists, resume from the last chunk boundary.
         // Round down to discard any partially-written chunk from a killed process —
@@ -448,23 +456,22 @@ public sealed class ClusterFileTransferService
             catch (Exception ex)
             {
                 consecutiveFailures++;
-                var delay = Math.Min(consecutiveFailures * 10, 60);
+                var delay = isWanNode
+                    ? profile.RetryDelaySeconds(consecutiveFailures)
+                    : Math.Min(consecutiveFailures * 10, 60);
 
                 Console.WriteLine(
                     $"Cluster: Download chunk failed at {offset / 1048576}MB " +
-                    $"(failure {consecutiveFailures}/{MaxConsecutiveFailures}): " +
+                    $"(failure {consecutiveFailures}/{maxSessionFailures}): " +
                     $"{ex.Message} — retrying in {delay}s...");
 
                 workItem.ErrorMessage = $"Download retry {consecutiveFailures} — {ex.Message}";
-                // Touch on retry too: a long backoff (12+ failures × 60s = 12+ minutes) would
-                // otherwise let the watchdog's freshness window expire on a download that's
-                // still actively retrying.
                 workItem.Touch();
                 await _hubContext.Clients.All.SendAsync("WorkItemUpdated", workItem, ct);
 
-                if (consecutiveFailures >= MaxConsecutiveFailures)
+                if (consecutiveFailures >= maxSessionFailures)
                     throw new Exception(
-                        $"Download failed after {MaxConsecutiveFailures} consecutive failures " +
+                        $"Download failed after {maxSessionFailures} consecutive failures " +
                         $"at {offset / 1048576}MB");
 
                 await Task.Delay(TimeSpan.FromSeconds(delay), ct);
