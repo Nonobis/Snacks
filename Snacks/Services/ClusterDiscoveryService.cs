@@ -885,9 +885,11 @@ public sealed class ClusterDiscoveryService
         {
             var dir = string.IsNullOrWhiteSpace(_config.NodeTempDirectory) ? workDir : _config.NodeTempDirectory;
             Directory.CreateDirectory(dir);
-            var root = Path.GetPathRoot(Path.GetFullPath(dir));
-            if (string.IsNullOrEmpty(root)) return 0;
-            var drive = new DriveInfo(root);
+            var fullPath = Path.GetFullPath(dir);
+            var drivePath = OperatingSystem.IsWindows()
+                ? Path.GetPathRoot(fullPath)!
+                : fullPath;
+            var drive = new DriveInfo(drivePath);
             return drive.AvailableFreeSpace;
         }
         catch
